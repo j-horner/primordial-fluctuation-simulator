@@ -1,0 +1,27 @@
+{
+    "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+    "name": "primordial-fluctuation-simulator",
+    "version": "0.1.0",
+    "description": [
+        "The CUDA NBody sample demo.",
+        "Optionally can be built with unit tests."
+    ],
+    "dependencies": [
+        "cli11",
+        "opengl",
+        "freeglut",
+        "glew",
+        "cuda-api-wrappers"
+    ],
+    "$default-features-explanation": "Users using this library transitively will not include tests.",
+    "default-features": [],
+    "features": {
+        "tests": {
+            "description": "Unit testing",
+            "dependencies": [
+                "catch2"
+            ]
+        }
+    },
+    "builtin-baseline": "ef7dbf94b9198bc58f45951adcf1f041fcbc5ea0"
+}
