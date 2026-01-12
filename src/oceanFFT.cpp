@@ -163,11 +163,15 @@ constexpr static char vertex_shader[] = R"(// GLSL vertex shader
                                                 eyeSpaceNormal   = (gl_NormalMatrix * normal).xyz;
                                             })";
 
+// height = 0.25    -> r = 1, g = 0, b = 0
+// height = 0       -> r = 1, g = 1, b = 0
+// height = -0.25   -> r = 0, g = 0, b = 1
+
 constexpr static char fragment_shader[] = R"(// GLSL fragment shader
                                             varying vec3 eyeSpacePos;
                                             varying vec3 worldSpaceNormal;
                                             varying vec3 eyeSpaceNormal;
-                                            // varying float height;
+                                            varying float height;
 
                                             uniform vec4 deepColor;
                                             uniform vec4 shallowColor;
@@ -184,13 +188,17 @@ constexpr static char fragment_shader[] = R"(// GLSL fragment shader
                                                 float fresnel   = pow(1.0 - facing, 5.0); // Fresnel approximation
                                                 float diffuse   = max(0.0, dot(worldSpaceNormalVector, lightDir));
 
-                                                // vec4 waterColor;
-                                                // waterColor.x = 2.0f*height;
-                                                // waterColor.y = 2.0f*(-height);
-                                                // waterColor.z = (1.0f - abs(height))*0.15f;
-                                                // waterColor.w = 1.0f;
+                                                float h = 2.0f*height;
+                                                float scale = 5.0f;
+                                                float offset = 0.25f;
+                                                
 
-                                                vec4 waterColor = mix(shallowColor, deepColor, facing);
+                                                vec4 waterColor;
+                                                waterColor.x = scale*(h + offset);  
+                                                waterColor.y = scale*((1.0f - 4.0f*abs(h)));
+                                                waterColor.z = scale*(offset - h);
+
+                                                // vec4 waterColor = mix(shallowColor, deepColor, facing);
                                                 // vec4 waterColor = deepColor;
     
                                                 // gl_FragColor = gl_Color;
