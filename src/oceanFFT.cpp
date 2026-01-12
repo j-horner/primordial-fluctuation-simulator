@@ -78,7 +78,7 @@ const char* sSDKsample = "CUDA FFT Ocean Simulation";
 
 ////////////////////////////////////////////////////////////////////////////////
 // constants
-unsigned int windowW = 512, windowH = 512;
+unsigned int windowW = 1920, windowH = 1008;
 
 const unsigned int meshSize  = 256;
 const unsigned int spectrumW = meshSize + 4;
@@ -94,7 +94,6 @@ struct cudaGraphicsResource *cuda_posVB_resource, *cuda_heightVB_resource,
 
 GLuint indexBuffer;
 GLuint shaderProg;
-char * vertShaderPath = 0, *fragShaderPath = 0;
 
 // mouse controls
 int   mouseOldX, mouseOldY;
@@ -138,6 +137,70 @@ int          fpsLimit         = 1;    // FPS limit for sampling
 unsigned int frameCount       = 0;
 unsigned int g_TotalErrors    = 0;
 
+constexpr static char vertex_shader[] = R"(// GLSL vertex shader
+                                            varying vec3 eyeSpacePos;
+                                            varying vec3 worldSpaceNormal;
+                                            varying vec3 eyeSpaceNormal;
+                                            varying float height;
+                                            uniform float heightScale; // = 0.5;
+                                            uniform float chopiness;   // = 1.0;
+                                            uniform vec2  size;        // = vec2(256.0, 256.0);
+
+                                            void main()
+                                            {
+                                                height     = gl_MultiTexCoord0.x;
+                                                vec2  slope      = gl_MultiTexCoord1.xy;
+
+                                                // calculate surface normal from slope for shading
+	                                            vec3 normal      = normalize(cross( vec3(0.0, slope.y*heightScale, 2.0 / size.x), vec3(2.0 / size.y, slope.x*heightScale, 0.0)));
+                                                worldSpaceNormal = normal;
+
+                                                // calculate position and transform to homogeneous clip space
+                                                vec4 pos         = vec4(gl_Vertex.x, height * heightScale, gl_Vertex.z, 1.0);
+                                                gl_Position      = gl_ModelViewProjectionMatrix * pos;
+    
+                                                eyeSpacePos      = (gl_ModelViewMatrix * pos).xyz;
+                                                eyeSpaceNormal   = (gl_NormalMatrix * normal).xyz;
+                                            })";
+
+constexpr static char fragment_shader[] = R"(// GLSL fragment shader
+                                            varying vec3 eyeSpacePos;
+                                            varying vec3 worldSpaceNormal;
+                                            varying vec3 eyeSpaceNormal;
+                                            // varying float height;
+
+                                            uniform vec4 deepColor;
+                                            uniform vec4 shallowColor;
+                                            uniform vec4 skyColor;
+                                            uniform vec3 lightDir;
+
+                                            void main()
+                                            {
+                                                vec3 eyeVector              = normalize(eyeSpacePos);
+                                                vec3 eyeSpaceNormalVector   = normalize(eyeSpaceNormal);
+                                                vec3 worldSpaceNormalVector = normalize(worldSpaceNormal);
+
+                                                float facing    = max(0.0, dot(eyeSpaceNormalVector, -eyeVector));
+                                                float fresnel   = pow(1.0 - facing, 5.0); // Fresnel approximation
+                                                float diffuse   = max(0.0, dot(worldSpaceNormalVector, lightDir));
+
+                                                // vec4 waterColor;
+                                                // waterColor.x = 2.0f*height;
+                                                // waterColor.y = 2.0f*(-height);
+                                                // waterColor.z = (1.0f - abs(height))*0.15f;
+                                                // waterColor.w = 1.0f;
+
+                                                vec4 waterColor = mix(shallowColor, deepColor, facing);
+                                                // vec4 waterColor = deepColor;
+    
+                                                // gl_FragColor = gl_Color;
+                                                // gl_FragColor = vec4(fresnel);
+                                                // gl_FragColor = vec4(diffuse);
+                                                // gl_FragColor = waterColor;
+                                                // gl_FragColor = waterColor*diffuse;
+                                                gl_FragColor = waterColor*diffuse + skyColor*fresnel;
+                                            })";
+
 ////////////////////////////////////////////////////////////////////////////////
 // kernels
 // #include <oceanFFT_kernel.cu>
@@ -159,7 +222,7 @@ void   createVBO(GLuint* vbo, int size);
 void   deleteVBO(GLuint* vbo);
 void   createMeshIndexBuffer(GLuint* id, int w, int h);
 void   createMeshPositionVBO(GLuint* id, int w, int h);
-GLuint loadGLSLProgram(const char* vertFileName, const char* fragFileName);
+GLuint loadGLSLProgram();
 
 // rendering callbacks
 void display();
@@ -671,14 +734,6 @@ bool initGL(int* argc, char** argv) {
     glutInitWindowSize(windowW, windowH);
     glutCreateWindow("CUDA FFT Ocean Simulation");
 
-    vertShaderPath = sdkFindFilePath("ocean.vert", argv[0]);
-    fragShaderPath = sdkFindFilePath("ocean.frag", argv[0]);
-
-    if (vertShaderPath == NULL || fragShaderPath == NULL) {
-        fprintf(stderr, "Error unable to find GLSL vertex and fragment shaders!\n");
-        exit(EXIT_FAILURE);
-    }
-
     // initialize necessary OpenGL extensions
 
     if (!isGLVersionSupported(2, 0)) {
@@ -702,7 +757,7 @@ bool initGL(int* argc, char** argv) {
     glEnable(GL_DEPTH_TEST);
 
     // load shader
-    shaderProg = loadGLSLProgram(vertShaderPath, fragShaderPath);
+    shaderProg = loadGLSLProgram();
 
     SDK_CHECK_ERROR_GL();
     return true;
@@ -787,28 +842,13 @@ void createMeshPositionVBO(GLuint* id, int w, int h) {
 }
 
 // Attach shader to a program
-int attachShader(GLuint prg, GLenum type, const char* name) {
-    GLuint shader;
-    FILE*  fp;
-    int    size, compiled;
-    char*  src;
+template <GLenum Type, const char* ShaderSource> int attachShader(GLuint prg) {
+    int size, compiled;
 
-    fp = fopen(name, "rb");
+    const auto src = ShaderSource;
 
-    if (!fp) {
-        return 0;
-    }
-
-    fseek(fp, 0, SEEK_END);
-    size = ftell(fp);
-    src  = (char*)malloc(size);
-
-    fseek(fp, 0, SEEK_SET);
-    fread(src, sizeof(char), size, fp);
-    fclose(fp);
-
-    shader = glCreateShader(type);
-    glShaderSource(shader, 1, (const char**)&src, (const GLint*)&size);
+    auto shader = glCreateShader(Type);
+    glShaderSource(shader, 1, (&src), (const GLint*)&size);
     glCompileShader(shader);
     glGetShaderiv(shader, GL_COMPILE_STATUS, (GLint*)&compiled);
 
@@ -822,8 +862,6 @@ int attachShader(GLuint prg, GLenum type, const char* name) {
         return 0;
     }
 
-    free(src);
-
     glAttachShader(prg, shader);
     glDeleteShader(shader);
 
@@ -831,21 +869,21 @@ int attachShader(GLuint prg, GLenum type, const char* name) {
 }
 
 // Create shader program from vertex shader and fragment shader files
-GLuint loadGLSLProgram(const char* vertFileName, const char* fragFileName) {
+GLuint loadGLSLProgram() {
     GLint  linked;
     GLuint program;
 
     program = glCreateProgram();
 
-    if (!attachShader(program, GL_VERTEX_SHADER, vertFileName)) {
+    if (!attachShader<GL_VERTEX_SHADER, vertex_shader>(program)) {
         glDeleteProgram(program);
-        fprintf(stderr, "Couldn't attach vertex shader from file %s\n", vertFileName);
+        fprintf(stderr, "Couldn't compile vertex shader \n");
         return 0;
     }
 
-    if (!attachShader(program, GL_FRAGMENT_SHADER, fragFileName)) {
+    if (!attachShader<GL_FRAGMENT_SHADER, fragment_shader>(program)) {
         glDeleteProgram(program);
-        fprintf(stderr, "Couldn't attach fragment shader from file %s\n", fragFileName);
+        fprintf(stderr, "Couldn't compile fragment shader\n");
         return 0;
     }
 
