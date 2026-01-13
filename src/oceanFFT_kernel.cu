@@ -51,41 +51,74 @@ __device__ float2 complex_mult(float2 ab, float2 cd) {
     return float2{ab.x * cd.x - ab.y * cd.y, ab.x * cd.y + ab.y * cd.x};
 }
 
+__device__ double2 conjugate(double2 arg) {
+    return double2{arg.x, -arg.y};
+}
+
+__device__ double2 complex_exp(double arg) {
+    return double2{cos(arg), sin(arg)};
+}
+
+__device__ double2 complex_add(double2 a, double2 b) {
+    return double2{a.x + b.x, a.y + b.y};
+}
+
+__device__ double2 complex_mult(double2 ab, double2 cd) {
+    return double2{ab.x * cd.x - ab.y * cd.y, ab.x * cd.y + ab.y * cd.x};
+}
+
 // generate wave heightfield at time t based on initial heightfield and
 // dispersion relationship
-__global__ void generateSpectrumKernel(float2* h, float2* h_dot, float2* h_output, unsigned int in_width, unsigned int out_width, unsigned int out_height, float t, float patchSize, float dt, float H0_2, float epsilon) {
-    unsigned int x         = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int y         = blockIdx.y * blockDim.y + threadIdx.y;
-    unsigned int in_index  = y * in_width + x;
-    unsigned int in_mindex = (out_height - y) * in_width + (out_width - x);    // mirrored
-    unsigned int out_index = y * out_width + x;
+__global__ void generateSpectrumKernel(double2* h, double2* h_dot, int in_width, int out_width, int out_height, double t, double k0, double dt, double H0_2, double epsilon) {
+    int x         = blockIdx.x * blockDim.x + threadIdx.x;
+    int y         = blockIdx.y * blockDim.y + threadIdx.y;
+    int in_index  = y * in_width + x;
+    int out_index = y * out_width + x;
 
     // calculate wave vector
-    float2 k;
-    k.x = (-(int)out_width / 2.0f + x) * (2.0f * CUDART_PI_F / patchSize);
-    k.y = (-(int)out_width / 2.0f + y) * (2.0f * CUDART_PI_F / patchSize);
+    if ((x <= out_width) && (y <= out_height)) {
+        const auto offset = static_cast<int>(out_width / 2);
+        double2    k;
+        k.x = (x - offset) * k0;
+        k.y = (y - offset) * k0;
 
-    if ((x < out_width) && (y < out_height)) {
-        const auto omega2 = (k.x * k.x + k.y * k.y) * H0_2 * expf(2.0f * (epsilon - 1.0f) * t);
+        const auto omega2 = (k.x * k.x + k.y * k.y) * H0_2 * exp(2.0 * (epsilon - 1.0) * t);
 
         auto h_t     = h[in_index];
         auto h_dot_t = h_dot[in_index];
 
-        const auto accel = complex_add(complex_mult(h_dot_t, {(epsilon - 3.0f), 0.f}), complex_mult({-omega2, 0.f}, h_t));
+        const auto accel = complex_add(complex_mult(h_dot_t, {(epsilon - 3.0), 0.}), complex_mult({-omega2, 0.}, h_t));
 
         // new velocity = old velocity + acceleration * dt
-        h_dot_t = complex_add(h_dot_t, complex_mult(accel, {dt, 0.f}));
+        h_dot_t = complex_add(h_dot_t, complex_mult(accel, {dt, 0.}));
 
         // new position = old position + velocity * dt
-        h_t             = complex_add(h_t, complex_mult(h_dot_t, {dt, 0.f}));
+        h_t             = complex_add(h_t, complex_mult(h_dot_t, {dt, 0.}));
         h[in_index]     = h_t;
         h_dot[in_index] = h_dot_t;
+    }
+}
 
-        float2 h0_k  = h_t;
-        float2 h0_mk = h[in_mindex];
+__global__ void generateSpectrumKernel(double2* h, float2* h_output, int in_width, int out_width, int out_height) {
+    int x         = blockIdx.x * blockDim.x + threadIdx.x;
+    int y         = blockIdx.y * blockDim.y + threadIdx.y;
+    int in_index  = y * in_width + x;
+    int in_mindex = (out_height - y) * in_width + (out_width - x);    // mirrored
+    int out_index = y * out_width + x;
 
+    // calculate wave vector
+    if ((x <= out_width) && (y <= out_height)) {
         // output frequency-space complex values
-        h_output[out_index] = complex_add(h0_k, conjugate(h0_mk));
+        const auto h_in   = h[in_index];
+        const auto h_in_m = h[in_mindex];
+
+        const auto h_out = complex_add(h_in, conjugate(h_in_m));
+
+        float2 h_outf;
+        h_outf.x = static_cast<float>(h_in.x);
+        h_outf.y = static_cast<float>(h_in.y);
+
+        h_output[out_index] = h_outf;
         // ht[out_index] = h0_k;
     }
 }
@@ -131,10 +164,11 @@ __global__ void calculateSlopeKernel(float* h, float2* slopeOut, unsigned int wi
 }
 
 // wrapper functions
-extern "C" void cudaGenerateSpectrumKernel(float2* h, float2* h_dot, float2* h_output, unsigned int in_width, unsigned int out_width, unsigned int out_height, float t, float patchSize, float dt, float H0_2, float epsilon) {
+extern "C" void cudaGenerateSpectrumKernel(double2* h, double2* h_dot, float2* h_output, int in_width, int out_width, int out_height, double t, double k0, double dt, double H0_2, double epsilon) {
     dim3 block(8, 8, 1);
     dim3 grid(cuda_iDivUp(out_width, block.x), cuda_iDivUp(out_height, block.y), 1);
-    generateSpectrumKernel<<<grid, block>>>(h, h_dot, h_output, in_width, out_width, out_height, t, patchSize, dt, H0_2, epsilon);
+    generateSpectrumKernel<<<grid, block>>>(h, h_dot, in_width, out_width, out_height, t, k0, dt, H0_2, epsilon);
+    generateSpectrumKernel<<<grid, block>>>(h, h_output, in_width, out_width, out_height);
 }
 
 extern "C" void cudaUpdateHeightmapKernel(float* d_heightMap, float2* d_ht, unsigned int width, unsigned int height, bool autoTest) {

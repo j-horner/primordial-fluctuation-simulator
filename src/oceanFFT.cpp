@@ -82,9 +82,11 @@ const char* sSDKsample = "CUDA FFT Ocean Simulation";
 // constants
 unsigned int windowW = 1920, windowH = 1008;
 
-const unsigned int meshSize  = 256;
-const unsigned int spectrumW = meshSize + 4;
-const unsigned int spectrumH = meshSize + 1;
+const unsigned int meshSize = 256;
+// const unsigned int spectrumW = meshSize + 4;
+// const unsigned int spectrumH = meshSize + 1;
+const auto spectrumW = meshSize + 4;
+const auto spectrumH = meshSize + 1;
 
 const int frameCompare = 4;
 
@@ -103,17 +105,17 @@ int   mouseButtons = 0;
 float rotateX = 20.0f, rotateY = 0.0f;
 float translateX = 0.0f, translateY = 0.0f, translateZ = -2.0f;
 
-bool animate     = true;
+bool animate     = false;
 bool drawPoints  = false;
 bool wireFrame   = false;
 bool g_hasDouble = false;
 
 // FFT data
 cufftHandle fftPlan;
-float2*     d_hk     = nullptr;    // heightfield
-float2*     d_hk_dot = nullptr;    // heightfield time derivative
-float2*     h_h0     = nullptr;
-float2*     h_h_dot0 = nullptr;
+double2*    d_hk     = nullptr;    // heightfield
+double2*    d_hk_dot = nullptr;    // heightfield time derivative
+double2*    h_h0     = nullptr;
+double2*    h_h_dot0 = nullptr;
 float2*     d_ht     = 0;    // heightfield at time t
 float2*     d_slope  = 0;
 
@@ -124,22 +126,22 @@ float2* g_sptr = NULL;
 // simulation parameters
 constexpr static auto g         = 9.81f;    // gravitational constant
 constexpr static auto A         = 1e-7f;    // wave scale factor
-constexpr static auto patchSize = 100;      // patch size
+constexpr static auto patchSize = 50;       // patch size
 float                 windSpeed = 100.0f;
 float                 windDir   = CUDART_PI_F / 3.0f;
 float                 dirDepend = 0.07f;
 
-constexpr static auto k0      = (2.0f * CUDART_PI_F / patchSize);
-constexpr static auto k_max   = (meshSize / 2) * k0 * std::numbers::sqrt2_v<float>;
-constexpr static auto H0_1    = 1.0f / k0;
+constexpr static auto k0      = (2.0 * CUDART_PI / patchSize);
+constexpr static auto k_max   = (meshSize / 2) * k0 * std::numbers::sqrt2;
+constexpr static auto H0_1    = 10.0 / k0;
 constexpr static auto H0_2    = H0_1 * H0_1;
-constexpr static auto epsilon = 0.01f;
+constexpr static auto epsilon = 0.01;
 
 StopWatchInterface* timer         = NULL;
-float               animTime      = 0.0f;
-float               prev_animTime = 0.f;
-float               prevTime      = 0.0f;
-float               animationRate = 0.0001f;
+auto                animTime      = 0.0;
+auto                prev_animTime = 0.;
+auto                prevTime      = 0.0;
+auto                animationRate = 0.00005;
 
 // Auto-Verification Code
 const int    frameCheckNumber = 4;
@@ -224,7 +226,7 @@ constexpr static char fragment_shader[] = R"(// GLSL fragment shader
 // kernels
 // #include <oceanFFT_kernel.cu>
 
-extern "C" void cudaGenerateSpectrumKernel(float2* h, float2* h_dot, float2* h_output, unsigned int in_width, unsigned int out_width, unsigned int out_height, float t, float patchSize, float dt, float H0_2, float epsilon);
+extern "C" void cudaGenerateSpectrumKernel(double2* h, double2* h_dot, float2* h_output, int in_width, int out_width, int out_height, double t, double k0, double dt, double H0_2, double epsilon);
 
 extern "C" void cudaUpdateHeightmapKernel(float* d_heightMap, float2* d_ht, unsigned int width, unsigned int height, bool autoTest);
 
@@ -251,8 +253,8 @@ void reshape(int w, int h);
 void timerEvent(int value);
 
 // Cuda functionality
-void runCuda(float t, float dt);
-void generate_h0(float2* h, float2* h_dot);
+void runCuda(double t, double dt);
+void generate_h0(double2* h, double2* h_dot);
 
 ////////////////////////////////////////////////////////////////////////////////
 // Program main
@@ -307,11 +309,11 @@ void runGraphicsTest(int argc, char** argv) {
     checkCudaErrors(cufftPlan2d(&fftPlan, meshSize, meshSize, CUFFT_C2C));
 
     // allocate memory
-    int spectrumSize = spectrumW * spectrumH * sizeof(float2);
+    int spectrumSize = spectrumW * spectrumH * sizeof(double2);
     checkCudaErrors(cudaMalloc((void**)&d_hk, spectrumSize));
     checkCudaErrors(cudaMalloc((void**)&d_hk_dot, spectrumSize));
-    h_h0     = (float2*)malloc(spectrumSize);
-    h_h_dot0 = (float2*)malloc(spectrumSize);
+    h_h0     = (double2*)malloc(spectrumSize);
+    h_h_dot0 = (double2*)malloc(spectrumSize);
     generate_h0(h_h0, h_h_dot0);
     checkCudaErrors(cudaMemcpy(d_hk, h_h0, spectrumSize, cudaMemcpyHostToDevice));
     checkCudaErrors(cudaMemcpy(d_hk_dot, h_h_dot0, spectrumSize, cudaMemcpyHostToDevice));
@@ -403,35 +405,33 @@ float phillips(float Kx, float Ky, float Vdir, float V, float a, float dir_depen
 }
 
 // Generate base heightfield in frequency space
-void generate_h0(float2* h, float2* h_dot) {
-    constexpr auto scale = 0.005f;
+void generate_h0(double2* h, double2* h_dot) {
+    constexpr auto scale = 0.005;
 
-    const auto norm = scale / sqrtf(epsilon);
+    const auto norm = scale / sqrt(epsilon);
 
-    for (unsigned int y = 0; y <= meshSize; y++) {
-        for (unsigned int x = 0; x <= meshSize; x++) {
-            float kx = (-(int)meshSize / 2.0f + x) * k0;
-            float ky = (-(int)meshSize / 2.0f + y) * k0;
+    const auto offset = static_cast<int>(meshSize / 2);
 
-            const auto k = sqrtf(kx * kx + ky * ky);
+    for (int y = 0; y <= meshSize; y++) {
+        for (int x = 0; x <= meshSize; x++) {
+            const auto kx = (x - offset) * k0;
+            const auto ky = (y - offset) * k0;
 
-            if (x == meshSize / 2) {
-                std::cout << kx << "\t" << ky << "\t" << k << "\t" << k * H0_1 << std::endl;
+            const auto k = sqrt(kx * kx + ky * ky);
+
+            const auto sqrt_k_1 = 1.0 / sqrt(k);
+
+            auto p_h = 0.0;
+
+            if ((kx != 0.0) || (ky != 0.0)) {
+                p_h = sqrt_k_1 * scale * norm;
             }
 
-            const auto sqrt_k_1 = 1.0f / sqrtf(k);
+            const auto Er_h = static_cast<double>(gauss());
+            const auto Ei_h = static_cast<double>(gauss());
 
-            auto p_h = sqrt_k_1 * scale * norm;
-
-            if (kx == 0.0f && ky == 0.0f) {
-                p_h = 0.0f;
-            }
-
-            const auto Er_h = gauss();
-            const auto Ei_h = gauss();
-
-            const auto h_re = Er_h * p_h * CUDART_SQRT_HALF_F;
-            const auto h_im = Ei_h * p_h * CUDART_SQRT_HALF_F;
+            const auto h_re = Er_h * p_h * CUDART_SQRT_HALF;
+            const auto h_im = Ei_h * p_h * CUDART_SQRT_HALF;
 
             const auto h_dot_re = ((k * H0_1) * h_im) - h_re;
             const auto h_dot_im = -((k * H0_1) * h_re) - h_im;
@@ -466,11 +466,11 @@ void generate_h0(float2* h, float2* h_dot) {
 ////////////////////////////////////////////////////////////////////////////////
 //! Run the Cuda kernels
 ////////////////////////////////////////////////////////////////////////////////
-void runCuda(float t, float dt) {
+void runCuda(double t, double dt) {
     size_t num_bytes;
 
     // generate wave spectrum in frequency domain
-    cudaGenerateSpectrumKernel(d_hk, d_hk_dot, d_ht, spectrumW, meshSize, meshSize, t, patchSize, dt, H0_2, epsilon);
+    cudaGenerateSpectrumKernel(d_hk, d_hk_dot, d_ht, spectrumW, meshSize, meshSize, t, k0, dt, H0_2, epsilon);
 
     // execute inverse FFT to convert to spatial domain
     checkCudaErrors(cufftExecC2C(fftPlan, d_ht, d_ht, CUFFT_INVERSE));
