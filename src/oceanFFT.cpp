@@ -201,7 +201,7 @@ constexpr static char fragment_shader[] = R"(// GLSL fragment shader
                                                 float fresnel   = pow(1.0 - facing, 5.0); // Fresnel approximation
                                                 float diffuse   = max(0.0, dot(worldSpaceNormalVector, lightDir));
 
-                                                float h = 1000.f*height;
+                                                float h = 500.f*height;
                                                 float scale = 5.0f;
                                                 float offset = 0.25f;
                                                 
@@ -406,7 +406,7 @@ float phillips(float Kx, float Ky, float Vdir, float V, float a, float dir_depen
 
 // Generate base heightfield in frequency space
 void generate_h0(double2* h, double2* h_dot) {
-    constexpr auto scale = 0.005;
+    constexpr auto scale = 0.01;
 
     const auto norm = scale / sqrt(epsilon);
 
