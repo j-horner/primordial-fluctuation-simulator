@@ -61,6 +61,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <numbers>
+
 #if defined(__APPLE__) || defined(MACOSX)
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #include <GLUT/glut.h>
@@ -108,27 +110,36 @@ bool g_hasDouble = false;
 
 // FFT data
 cufftHandle fftPlan;
-float2*     d_h0    = 0;    // heightfield at time 0
-float2*     h_h0    = 0;
-float2*     d_ht    = 0;    // heightfield at time t
-float2*     d_slope = 0;
+float2*     d_hk     = nullptr;    // heightfield
+float2*     d_hk_dot = nullptr;    // heightfield time derivative
+float2*     h_h0     = nullptr;
+float2*     h_h_dot0 = nullptr;
+float2*     d_ht     = 0;    // heightfield at time t
+float2*     d_slope  = 0;
 
 // pointers to device object
 float*  g_hptr = NULL;
 float2* g_sptr = NULL;
 
 // simulation parameters
-const float g         = 9.81f;    // gravitational constant
-const float A         = 1e-7f;    // wave scale factor
-const float patchSize = 100;      // patch size
-float       windSpeed = 100.0f;
-float       windDir   = CUDART_PI_F / 3.0f;
-float       dirDepend = 0.07f;
+constexpr static auto g         = 9.81f;    // gravitational constant
+constexpr static auto A         = 1e-7f;    // wave scale factor
+constexpr static auto patchSize = 100;      // patch size
+float                 windSpeed = 100.0f;
+float                 windDir   = CUDART_PI_F / 3.0f;
+float                 dirDepend = 0.07f;
+
+constexpr static auto k0      = (2.0f * CUDART_PI_F / patchSize);
+constexpr static auto k_max   = (meshSize / 2) * k0 * std::numbers::sqrt2_v<float>;
+constexpr static auto H0_1    = 1.0f / k0;
+constexpr static auto H0_2    = H0_1 * H0_1;
+constexpr static auto epsilon = 0.01f;
 
 StopWatchInterface* timer         = NULL;
 float               animTime      = 0.0f;
+float               prev_animTime = 0.f;
 float               prevTime      = 0.0f;
-float               animationRate = -0.001f;
+float               animationRate = 0.0001f;
 
 // Auto-Verification Code
 const int    frameCheckNumber = 4;
@@ -188,7 +199,7 @@ constexpr static char fragment_shader[] = R"(// GLSL fragment shader
                                                 float fresnel   = pow(1.0 - facing, 5.0); // Fresnel approximation
                                                 float diffuse   = max(0.0, dot(worldSpaceNormalVector, lightDir));
 
-                                                float h = 2.0f*height;
+                                                float h = 1000.f*height;
                                                 float scale = 5.0f;
                                                 float offset = 0.25f;
                                                 
@@ -213,7 +224,7 @@ constexpr static char fragment_shader[] = R"(// GLSL fragment shader
 // kernels
 // #include <oceanFFT_kernel.cu>
 
-extern "C" void cudaGenerateSpectrumKernel(float2* d_h0, float2* d_ht, unsigned int in_width, unsigned int out_width, unsigned int out_height, float animTime, float patchSize);
+extern "C" void cudaGenerateSpectrumKernel(float2* h, float2* h_dot, float2* h_output, unsigned int in_width, unsigned int out_width, unsigned int out_height, float t, float patchSize, float dt, float H0_2, float epsilon);
 
 extern "C" void cudaUpdateHeightmapKernel(float* d_heightMap, float2* d_ht, unsigned int width, unsigned int height, bool autoTest);
 
@@ -221,7 +232,6 @@ extern "C" void cudaCalculateSlopeKernel(float* h, float2* slopeOut, unsigned in
 
 ////////////////////////////////////////////////////////////////////////////////
 // forward declarations
-void runAutoTest(int argc, char** argv);
 void runGraphicsTest(int argc, char** argv);
 
 // GL functionality
@@ -241,9 +251,8 @@ void reshape(int w, int h);
 void timerEvent(int value);
 
 // Cuda functionality
-void runCuda();
-void runCudaTest(char* exec_path);
-void generate_h0(float2* h0);
+void runCuda(float t, float dt);
+void generate_h0(float2* h, float2* h_dot);
 
 ////////////////////////////////////////////////////////////////////////////////
 // Program main
@@ -252,65 +261,16 @@ int main(int argc, char** argv) {
     printf("NOTE: The CUDA Samples are not meant for performance measurements. "
            "Results may vary when GPU Boost is enabled.\n\n");
 
-    // check for command line arguments
-    if (checkCmdLineFlag(argc, (const char**)argv, "qatest")) {
-        animate  = false;
-        fpsLimit = frameCheckNumber;
-        runAutoTest(argc, argv);
-    } else {
-        printf("[%s]\n\n"
-               "Left mouse button          - rotate\n"
-               "Middle mouse button        - pan\n"
-               "Right mouse button         - zoom\n"
-               "'w' key                    - toggle wireframe\n",
-               sSDKsample);
+    printf("[%s]\n\n"
+           "Left mouse button          - rotate\n"
+           "Middle mouse button        - pan\n"
+           "Right mouse button         - zoom\n"
+           "'w' key                    - toggle wireframe\n",
+           sSDKsample);
 
-        runGraphicsTest(argc, argv);
-    }
+    runGraphicsTest(argc, argv);
 
     exit(EXIT_SUCCESS);
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//! Run test
-////////////////////////////////////////////////////////////////////////////////
-void runAutoTest(int argc, char** argv) {
-    printf("%s Starting...\n\n", argv[0]);
-
-    // Cuda init
-    int dev = findCudaDevice(argc, (const char**)argv);
-
-    cudaDeviceProp deviceProp;
-    checkCudaErrors(cudaGetDeviceProperties(&deviceProp, dev));
-    printf("Compute capability %d.%d\n", deviceProp.major, deviceProp.minor);
-
-    // create FFT plan
-    checkCudaErrors(cufftPlan2d(&fftPlan, meshSize, meshSize, CUFFT_C2C));
-
-    // allocate memory
-    int spectrumSize = spectrumW * spectrumH * sizeof(float2);
-    checkCudaErrors(cudaMalloc((void**)&d_h0, spectrumSize));
-    h_h0 = (float2*)malloc(spectrumSize);
-    generate_h0(h_h0);
-    checkCudaErrors(cudaMemcpy(d_h0, h_h0, spectrumSize, cudaMemcpyHostToDevice));
-
-    int outputSize = meshSize * meshSize * sizeof(float2);
-    checkCudaErrors(cudaMalloc((void**)&d_ht, outputSize));
-    checkCudaErrors(cudaMalloc((void**)&d_slope, outputSize));
-
-    sdkCreateTimer(&timer);
-    sdkStartTimer(&timer);
-    prevTime = sdkGetTimerValue(&timer);
-
-    runCudaTest(argv[0]);
-
-    checkCudaErrors(cudaFree(d_ht));
-    checkCudaErrors(cudaFree(d_slope));
-    checkCudaErrors(cudaFree(d_h0));
-    checkCudaErrors(cufftDestroy(fftPlan));
-    free(h_h0);
-
-    exit(g_TotalErrors == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -348,10 +308,13 @@ void runGraphicsTest(int argc, char** argv) {
 
     // allocate memory
     int spectrumSize = spectrumW * spectrumH * sizeof(float2);
-    checkCudaErrors(cudaMalloc((void**)&d_h0, spectrumSize));
-    h_h0 = (float2*)malloc(spectrumSize);
-    generate_h0(h_h0);
-    checkCudaErrors(cudaMemcpy(d_h0, h_h0, spectrumSize, cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMalloc((void**)&d_hk, spectrumSize));
+    checkCudaErrors(cudaMalloc((void**)&d_hk_dot, spectrumSize));
+    h_h0     = (float2*)malloc(spectrumSize);
+    h_h_dot0 = (float2*)malloc(spectrumSize);
+    generate_h0(h_h0, h_h_dot0);
+    checkCudaErrors(cudaMemcpy(d_hk, h_h0, spectrumSize, cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_hk_dot, h_h_dot0, spectrumSize, cudaMemcpyHostToDevice));
 
     int outputSize = meshSize * meshSize * sizeof(float2);
     checkCudaErrors(cudaMalloc((void**)&d_ht, outputSize));
@@ -372,7 +335,11 @@ void runGraphicsTest(int argc, char** argv) {
     createMeshPositionVBO(&posVertexBuffer, meshSize, meshSize);
     createMeshIndexBuffer(&indexBuffer, meshSize, meshSize);
 
-    runCuda();
+    prev_animTime = animTime;
+
+    const auto dt = animTime - prev_animTime;
+
+    runCuda(animTime, dt);
 
     // register callbacks
     glutDisplayFunc(display);
@@ -436,29 +403,62 @@ float phillips(float Kx, float Ky, float Vdir, float V, float a, float dir_depen
 }
 
 // Generate base heightfield in frequency space
-void generate_h0(float2* h0) {
+void generate_h0(float2* h, float2* h_dot) {
+    constexpr auto scale = 0.005f;
+
+    const auto norm = scale / sqrtf(epsilon);
+
     for (unsigned int y = 0; y <= meshSize; y++) {
         for (unsigned int x = 0; x <= meshSize; x++) {
-            float kx = (-(int)meshSize / 2.0f + x) * (2.0f * CUDART_PI_F / patchSize);
-            float ky = (-(int)meshSize / 2.0f + y) * (2.0f * CUDART_PI_F / patchSize);
+            float kx = (-(int)meshSize / 2.0f + x) * k0;
+            float ky = (-(int)meshSize / 2.0f + y) * k0;
 
-            float P = sqrtf(phillips(kx, ky, windDir, windSpeed, A, dirDepend));
+            const auto k = sqrtf(kx * kx + ky * ky);
+
+            if (x == meshSize / 2) {
+                std::cout << kx << "\t" << ky << "\t" << k << "\t" << k * H0_1 << std::endl;
+            }
+
+            const auto sqrt_k_1 = 1.0f / sqrtf(k);
+
+            auto p_h = sqrt_k_1 * scale * norm;
 
             if (kx == 0.0f && ky == 0.0f) {
-                P = 0.0f;
+                p_h = 0.0f;
             }
+
+            const auto Er_h = gauss();
+            const auto Ei_h = gauss();
+
+            const auto h_re = Er_h * p_h * CUDART_SQRT_HALF_F;
+            const auto h_im = Ei_h * p_h * CUDART_SQRT_HALF_F;
+
+            const auto h_dot_re = ((k * H0_1) * h_im) - h_re;
+            const auto h_dot_im = -((k * H0_1) * h_re) - h_im;
+
+            int i      = y * spectrumW + x;
+            h[i].x     = h_re;
+            h[i].y     = h_im;
+            h_dot[i].x = h_dot_re;
+            h_dot[i].y = h_dot_im;
+
+            // float P = sqrtf(phillips(kx, ky, windDir, windSpeed, A, dirDepend));
+
+            // if (kx == 0.0f && ky == 0.0f) {
+            //     P = 0.0f;
+            // }
 
             // float Er = urand()*2.0f-1.0f;
             // float Ei = urand()*2.0f-1.0f;
-            float Er = gauss();
-            float Ei = gauss();
+            // float Er = gauss();
+            // float Ei = gauss();
 
-            float h0_re = Er * P * CUDART_SQRT_HALF_F;
-            float h0_im = Ei * P * CUDART_SQRT_HALF_F;
+            // float h0_re = Er * P * CUDART_SQRT_HALF_F;
+            // float h0_im = Ei * P * CUDART_SQRT_HALF_F;
 
-            int i   = y * spectrumW + x;
-            h0[i].x = h0_re;
-            h0[i].y = h0_im;
+            // int i  = y * spectrumW + x;
+            // h[i].x = h0_re;
+            // h[i].y = h0_im;
         }
     }
 }
@@ -466,11 +466,11 @@ void generate_h0(float2* h0) {
 ////////////////////////////////////////////////////////////////////////////////
 //! Run the Cuda kernels
 ////////////////////////////////////////////////////////////////////////////////
-void runCuda() {
+void runCuda(float t, float dt) {
     size_t num_bytes;
 
     // generate wave spectrum in frequency domain
-    cudaGenerateSpectrumKernel(d_h0, d_ht, spectrumW, meshSize, meshSize, animTime, patchSize);
+    cudaGenerateSpectrumKernel(d_hk, d_hk_dot, d_ht, spectrumW, meshSize, meshSize, t, patchSize, dt, H0_2, epsilon);
 
     // execute inverse FFT to convert to spatial domain
     checkCudaErrors(cufftExecC2C(fftPlan, d_ht, d_ht, CUFFT_INVERSE));
@@ -491,50 +491,6 @@ void runCuda() {
     checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_slopeVB_resource, 0));
 }
 
-void runCudaTest(char* exec_path) {
-    checkCudaErrors(cudaMalloc((void**)&g_hptr, meshSize * meshSize * sizeof(float)));
-    checkCudaErrors(cudaMalloc((void**)&g_sptr, meshSize * meshSize * sizeof(float2)));
-
-    // generate wave spectrum in frequency domain
-    cudaGenerateSpectrumKernel(d_h0, d_ht, spectrumW, meshSize, meshSize, animTime, patchSize);
-
-    // execute inverse FFT to convert to spatial domain
-    checkCudaErrors(cufftExecC2C(fftPlan, d_ht, d_ht, CUFFT_INVERSE));
-
-    // update heightmap values
-    cudaUpdateHeightmapKernel(g_hptr, d_ht, meshSize, meshSize, true);
-
-    {
-        float* hptr = (float*)malloc(meshSize * meshSize * sizeof(float));
-        cudaMemcpy((void*)hptr, (void*)g_hptr, meshSize * meshSize * sizeof(float), cudaMemcpyDeviceToHost);
-        sdkDumpBin((void*)hptr, meshSize * meshSize * sizeof(float), "spatialDomain.bin");
-
-        if (!sdkCompareBin2BinFloat("spatialDomain.bin", "ref_spatialDomain.bin", meshSize * meshSize, MAX_EPSILON, THRESHOLD, exec_path)) {
-            g_TotalErrors++;
-        }
-
-        free(hptr);
-    }
-
-    // calculate slope for shading
-    cudaCalculateSlopeKernel(g_hptr, g_sptr, meshSize, meshSize);
-
-    {
-        float2* sptr = (float2*)malloc(meshSize * meshSize * sizeof(float2));
-        cudaMemcpy((void*)sptr, (void*)g_sptr, meshSize * meshSize * sizeof(float2), cudaMemcpyDeviceToHost);
-        sdkDumpBin(sptr, meshSize * meshSize * sizeof(float2), "slopeShading.bin");
-
-        if (!sdkCompareBin2BinFloat("slopeShading.bin", "ref_slopeShading.bin", meshSize * meshSize * 2, MAX_EPSILON, THRESHOLD, exec_path)) {
-            g_TotalErrors++;
-        }
-
-        free(sptr);
-    }
-
-    checkCudaErrors(cudaFree(g_hptr));
-    checkCudaErrors(cudaFree(g_sptr));
-}
-
 // void computeFPS()
 //{
 //    frameCount++;
@@ -551,7 +507,8 @@ void runCudaTest(char* exec_path) {
 void display() {
     // run CUDA kernel to generate vertex positions
     if (animate) {
-        runCuda();
+        runCuda(animTime, animTime - prev_animTime);
+        prev_animTime = animTime;
     }
 
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -657,10 +614,12 @@ void cleanup() {
     deleteVBO(&heightVertexBuffer);
     deleteVBO(&slopeVertexBuffer);
 
-    checkCudaErrors(cudaFree(d_h0));
+    checkCudaErrors(cudaFree(d_hk));
     checkCudaErrors(cudaFree(d_slope));
     checkCudaErrors(cudaFree(d_ht));
+    checkCudaErrors(cudaFree(d_hk_dot));
     free(h_h0);
+    free(h_h_dot0);
     cufftDestroy(fftPlan);
 }
 
